@@ -40,12 +40,12 @@ class Settings(BaseSettings):
     batch_size: int = 32
     
     # Advanced Preprocessing Settings
-    use_advanced_preprocessing: bool = False  # Set to True to enable
+    use_advanced_preprocessing: bool = True  # Set to True to enable
     preprocessing_profile: str = "auto"  # auto, lab, or field
     preprocessing_cache_enabled: bool = True
     
     # Query Preprocessing Settings (NEW!)
-    use_query_preprocessing: bool = True  # Enable query image enhancement and normalization
+    use_query_preprocessing: bool = False  # Disable to avoid conflicts with advanced preprocessing
     query_enhancement_enabled: bool = True  # Enable sharpness and contrast enhancement
     query_normalization_enabled: bool = True  # Enable color correction and brightness adjustment
     query_denoising_enabled: bool = True  # Enable noise reduction
@@ -61,12 +61,16 @@ class Settings(BaseSettings):
     preprocessing_quality_threshold_contrast: float = 50.0  # Skip if higher contrast
     
     # Advanced Preprocessing Algorithm Settings (ADVANCED!)
-    enable_advanced_preprocessing: bool = False  # Enable deep learning-inspired algorithms
+    enable_advanced_preprocessing: bool = True  # Enable deep learning-inspired algorithms
     enable_deep_background_removal: bool = True  # Sophisticated background removal
     enable_multipoint_rotation: bool = True  # Multi-point rotation detection
     enable_leaf_aware_processing: bool = True  # Leaf-characteristic aware preprocessing
-    enable_learned_parameters: bool = True  # Learn from successful matches
-    learned_params_path: str = "./data/learned_params.pkl"  # Path to learned parameters
+    enable_learned_parameters: bool = False # Disable learning system to avoid conflicts with ResNet-50 feature space
+    learned_params_path: str = "./data/learned_params.pkl"  # Path to learned parameters (not used when disabled)
+    
+    # Feature Normalization Settings
+    ensure_standard_normalization: bool = True  # Ensure preprocessing maintains ImageNet normalization stats
+    normalize_after_preprocessing: bool = True  # Apply standard ImageNet normalization after preprocessing
     
     # Similarity Metric Settings
     # FAISS Index is built with COSINE similarity (best for image search)

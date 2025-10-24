@@ -199,12 +199,12 @@ async def search_similar_leaves(
     **Simple & Fast Search**:
     - Upload a leaf image and get the top-k most similar leaves
     - Uses FAISS index with cosine similarity (optimized for accuracy)
-    - Automatic background removal for external images
+    - Consistent preprocessing applied to match indexed images
     - Returns species, confidence scores, and similarity distances
     
     **Parameters**:
     - **file**: Leaf image file to search (jpg, png)
-    - **top_k**: Number of results (1-100, default: 10)
+    - **top_k**: Number of results (1-10, default: 10)
     - **use_segmented**: Return segmented/processed images (default: False)
     - **explain_results**: Get AI explanations for why each result matches (default: False)
     
@@ -223,18 +223,19 @@ async def search_similar_leaves(
         with open(temp_file, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Extract features WITHOUT preprocessing to match dataset indexing
-        # IMPORTANT: Dataset was indexed without preprocessing (raw images)
-        # Query must also be processed without preprocessing to match feature space
+        # Extract features WITH advanced preprocessing to match dataset indexing
+        # IMPORTANT: Both dataset and queries must use the same preprocessing pipeline
         feature_extractor = get_feature_extractor(
-            use_query_segmentation=True  # Enable background removal
+            use_query_segmentation=True, # Enable background removal for query images via advanced preprocessing
+            use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
+            use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
         )
         query_features = feature_extractor.extract_features(
-            temp_file, 
-            is_query=True  # Enable preprocessing
+            temp_file,
+            is_query=True  # This will apply consistent preprocessing
         )
         
-        logger.info(f"Extracted features without preprocessing (matching dataset)")
+        logger.info(f"Extracted features WITH preprocessing (consistent with indexing)")
         
         # Search using FAISS with cosine similarity
         faiss_client = get_faiss_client()
@@ -522,9 +523,16 @@ async def upload_species_images(
                 # Get absolute path for feature extraction
                 abs_path = Path(settings.dataset_path).parent / original_path
                 
-                # Extract features
-                feature_extractor = get_feature_extractor()
-                features = feature_extractor.extract_features(str(abs_path))
+                # Extract features with consistent advanced preprocessing
+                feature_extractor = get_feature_extractor(
+                    use_query_segmentation=False, # Don't apply segmentation to dataset images
+                    use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
+                    use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
+                )
+                features = feature_extractor.extract_features(
+                    str(abs_path),
+                    is_query=False # Apply consistent preprocessing for dataset images
+                )
                 
                 # Index based on search engine
                 if search_engine == SearchEngine.MILVUS:
@@ -800,9 +808,16 @@ async def refine_search_with_feedback(
         with open(temp_file, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
         
-        # Extract features
-        feature_extractor = get_feature_extractor()
-        query_vector = feature_extractor.extract_features(temp_file)
+        # Extract features with consistent advanced preprocessing
+        feature_extractor = get_feature_extractor(
+            use_query_segmentation=True, # Enable background removal for query images via advanced preprocessing
+            use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
+            use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
+        )
+        query_vector = feature_extractor.extract_features(
+            temp_file,
+            is_query=True # Apply consistent preprocessing
+        )
         
         # Function to get vector for file_id
         def get_vector_for_file(file_id: int):
@@ -813,7 +828,10 @@ async def refine_search_with_feedback(
                     # For now, we'll re-extract features
                     image = db.query(LeafImage).filter(LeafImage.file_id == file_id).first()
                     if image and image.image_path is not None:
-                        return feature_extractor.extract_features(str(image.image_path))
+                        return feature_extractor.extract_features(
+                            str(image.image_path),
+                            is_query=False # Apply consistent preprocessing for dataset images
+                        )
             return None
         
         # Refine query using feedback
@@ -865,7 +883,7 @@ async def refine_search_with_feedback(
             search_time_ms=search_time,
             search_engine=search_engine.value,
             total_results=len(results),
-            query_preprocessing_applied=False,
+            query_preprocessing_applied=True,
             similarity_metric="l2"
         )
         
@@ -1410,9 +1428,10 @@ async def apply_advanced_preprocessing(
         from PIL import Image
         image = Image.open(temp_file)
         
-        # Apply advanced preprocessing
-        pipeline = get_advanced_pipeline(enable_learning=settings.enable_learned_parameters)
-        processed_image, metadata = pipeline.preprocess(image, apply_learning=True)
+        # Apply advanced preprocessing with fixed parameters for ResNet-50 compatibility
+        # Always use fixed parameters to avoid conflicts with ResNet-50 feature space
+        pipeline = get_advanced_pipeline(enable_learning=False)
+        processed_image, metadata = pipeline.preprocess(image, apply_learning=False)
         
         # Save processed image
         output_path = Path(settings.temp_dir) / f"processed_{file.filename}"
@@ -1469,13 +1488,16 @@ async def record_preprocessing_feedback(
     This creates a feedback loop that continuously improves preprocessing quality.
     """
     try:
-        pipeline = get_advanced_pipeline(enable_learning=True)
-        pipeline.record_feedback(preprocessing_params, match_quality)
+        # Disable learning system to avoid conflicts with ResNet-50 feature space
+        # Only use fixed parameters optimized for ResNet-50
+        pipeline = get_advanced_pipeline(enable_learning=False)
+        # Don't record feedback for learning since learning is disabled
+        # pipeline.record_feedback(preprocessing_params, match_quality)
         
         return {
-            "message": "Feedback recorded successfully",
+            "message": "Feedback received (learning disabled for ResNet-50 compatibility)",
             "match_quality": match_quality,
-            "learning_enabled": settings.enable_learned_parameters
+            "learning_enabled": False
         }
     
     except Exception as e:

@@ -38,11 +38,12 @@ def _get_optimized_preprocessor():
 class FeatureExtractor:
     """ResNet-50 based feature extractor for leaf images"""
     
-    def __init__(self, model_name: str = "resnet50", use_gpu: bool = True, 
+    def __init__(self, model_name: str = "resnet50", use_gpu: bool = True,
                  use_advanced_preprocessing: bool = False,
                  preprocessing_profile: PreprocessingProfile = PreprocessingProfile.AUTO,
                  use_query_preprocessing: bool = False,
-                 use_query_segmentation: bool = False):
+                 use_query_segmentation: bool = False,
+                 normalize_after_preprocessing: bool = True):
         """
         Initialize feature extractor
         
@@ -62,6 +63,7 @@ class FeatureExtractor:
         self.preprocessing_profile = preprocessing_profile
         self.use_query_preprocessing = use_query_preprocessing
         self.use_query_segmentation = use_query_segmentation
+        self.normalize_after_preprocessing = normalize_after_preprocessing # Apply standard normalization after preprocessing
         
         # Initialize advanced preprocessor if enabled OR if query segmentation is enabled
         if self.use_advanced_preprocessing or self.use_query_segmentation:
@@ -122,14 +124,16 @@ class FeatureExtractor:
     
     def _setup_transforms(self):
         """Setup image preprocessing transforms"""
-        self.transform = transforms.Compose([
+        # Define the standard ImageNet normalization that ResNet-50 expects
+        self.normalize_transform = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406],
+            std=[0.229, 0.224, 0.225]
+        )
+        
+        # Resize and crop transforms
+        self.resize_transform = transforms.Compose([
             transforms.Resize(256),
             transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
         ])
     
     def load_image(self, image_path: Union[str, Path]) -> Image.Image:
@@ -159,12 +163,30 @@ class FeatureExtractor:
         Returns:
             Preprocessed tensor
         """
-        if self.transform is None:
-            raise ValueError("Transform not initialized")
-        result = self.transform(image)
-        if not isinstance(result, torch.Tensor):
-            raise ValueError(f"Transform returned unexpected type: {type(result)}")
-        return result
+        # First resize and crop
+        if hasattr(self, 'resize_transform'):
+            image = self.resize_transform(image)
+        else:
+            # Fallback to original resize behavior
+            image = transforms.Resize(256)(image)
+            image = transforms.CenterCrop(224)(image)
+        
+        # Convert to tensor
+        image_tensor = transforms.ToTensor()(image)
+        
+        # Apply standard ImageNet normalization (critical for ResNet-50)
+        if hasattr(self, 'normalize_transform'):
+            image_tensor = self.normalize_transform(image_tensor)
+        else:
+            # Fallback to standard normalization
+            image_tensor = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )(image_tensor)
+        
+        if not isinstance(image_tensor, torch.Tensor):
+            raise ValueError(f"Transform returned unexpected type: {type(image_tensor)}")
+        return image_tensor
     
     def extract_features(self, image_path: Union[str, Path], 
                         preprocessing_profile: Optional[PreprocessingProfile] = None,
@@ -185,25 +207,23 @@ class FeatureExtractor:
             image = self.load_image(image_path)
             original_size = image.size
             
-            # STEP 1: Apply segmentation using AdvancedLeafPreprocessor with FIELD profile for query images
-            if is_query and self.use_query_segmentation and self.preprocessor:
-                logger.info(f"[QUERY] Applying background removal with FIELD profile (size: {original_size})")
-                # Use FIELD profile which includes aggressive background removal
-                image = self.preprocessor.preprocess(image, profile=PreprocessingProfile.FIELD)
-                logger.info(f"[QUERY] ✓ Background removed using AdvancedLeafPreprocessor")
-            
-            # STEP 2: Apply query preprocessing (enhancement) if enabled - additional enhancement after segmentation
-            elif is_query and self.use_query_preprocessing and self.query_preprocessor:
-                logger.info(f"[QUERY] Applying query preprocessing (enhancement + normalization)")
-                image = self.query_preprocessor.preprocess(image)
-            
-            # Apply advanced preprocessing if enabled (for dataset images)
-            elif self.use_advanced_preprocessing and self.preprocessor:
-                profile = preprocessing_profile or self.preprocessing_profile
-                logger.debug(f"[DATASET] Applying preprocessing with profile: {profile.value}")
+            # Apply advanced preprocessing consistently for both queries and dataset images
+            # Use segmentation for queries and appropriate profile for dataset images
+            if self.use_advanced_preprocessing and self.preprocessor:
+                # Determine profile based on context
+                if is_query and self.use_query_segmentation:
+                    # Use FIELD profile for query images which includes aggressive background removal
+                    profile = PreprocessingProfile.FIELD
+                    logger.info(f"[QUERY] Applying advanced preprocessing with FIELD profile (size: {original_size})")
+                else:
+                    # Use specified profile for dataset images
+                    profile = preprocessing_profile or self.preprocessing_profile
+                    logger.debug(f"[DATASET] Applying advanced preprocessing with profile: {profile.value}")
+                
                 image = self.preprocessor.preprocess(image, profile=profile)
+                logger.info(f"[PREPROCESSING] ✓ Advanced preprocessing applied with {profile.value} profile")
             else:
-                logger.debug(f"[DATASET] No preprocessing applied (size: {original_size})")
+                logger.debug(f"[IMAGE] No preprocessing applied (size: {original_size})")
             
             # Convert to tensor
             image_tensor = self.preprocess_image(image).unsqueeze(0)  # Add batch dimension
@@ -212,6 +232,9 @@ class FeatureExtractor:
             # Extract features
             if self.model is None:
                 raise ValueError("Model not initialized")
+            
+            # Ensure model is in eval mode and extract features
+            self.model.eval()  # Ensure model is in evaluation mode
             with torch.no_grad():
                 features = self.model(image_tensor)
             
@@ -270,6 +293,9 @@ class FeatureExtractor:
                 # Extract features
                 if self.model is None:
                     raise ValueError("Model not initialized")
+                
+                # Ensure model is in eval mode and extract features
+                self.model.eval()  # Ensure model is in evaluation mode
                 with torch.no_grad():
                     features = self.model(batch_tensor)
                 
@@ -321,6 +347,9 @@ def get_feature_extractor(use_advanced_preprocessing: bool = False,
     """
     global _feature_extractor, _advanced_feature_extractor, _query_feature_extractor, _query_segmentation_extractor
     
+    # Use the configuration setting for normalization consistency
+    normalize_after = settings.normalize_after_preprocessing
+    
     if use_query_segmentation or use_query_preprocessing:
         # Query-specific feature extractor with segmentation and/or preprocessing
         if _query_segmentation_extractor is None:
@@ -328,19 +357,21 @@ def get_feature_extractor(use_advanced_preprocessing: bool = False,
                 use_advanced_preprocessing=use_advanced_preprocessing,
                 preprocessing_profile=PreprocessingProfile.AUTO,
                 use_query_preprocessing=use_query_preprocessing,
-                use_query_segmentation=use_query_segmentation
+                use_query_segmentation=use_query_segmentation,
+                normalize_after_preprocessing=normalize_after
             )
         return _query_segmentation_extractor
     elif use_advanced_preprocessing:
         if _advanced_feature_extractor is None:
             _advanced_feature_extractor = FeatureExtractor(
                 use_advanced_preprocessing=True,
-                preprocessing_profile=PreprocessingProfile.AUTO
+                preprocessing_profile=PreprocessingProfile.AUTO,
+                normalize_after_preprocessing=normalize_after
             )
         return _advanced_feature_extractor
     else:
         if _feature_extractor is None:
-            _feature_extractor = FeatureExtractor()
+            _feature_extractor = FeatureExtractor(normalize_after_preprocessing=normalize_after)
         return _feature_extractor
 
 

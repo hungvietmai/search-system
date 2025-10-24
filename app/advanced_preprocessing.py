@@ -611,7 +611,7 @@ class AdvancedPreprocessingPipeline:
     Complete advanced preprocessing pipeline integrating all components
     """
     
-    def __init__(self, enable_learning: bool = True):
+    def __init__(self, enable_learning: bool = False):
         """
         Initialize advanced preprocessing pipeline
         
@@ -662,13 +662,29 @@ class AdvancedPreprocessingPipeline:
         adaptive_params = self.characteristic_detector.get_adaptive_parameters(characteristics)
         metadata['adaptive_params'] = adaptive_params
         
-        # Stage 5: Apply learned parameters if available
+        # Stage 5: Use fixed parameters optimized for ResNet-50 feature space instead of learned parameters
+        # Disable learning system to avoid conflicts with ResNet-50 feature space
         if apply_learning and self.param_manager:
-            learned_params = self.param_manager.get_best_params()
-            if learned_params:
-                metadata['learned_params'] = learned_params
-                # Merge with adaptive params (learned takes precedence)
-                adaptive_params.update(learned_params)
+            # Fixed parameters optimized for ResNet-50 feature space
+            fixed_params = {
+                'edge_enhancement': 1.3,  # Moderate edge enhancement for ResNet-50
+                'smoothing_strength': 0.8,  # Balanced smoothing
+                'denoise_strength': 8,  # Moderate denoising
+                'rotation_sensitive': False  # Standard rotation correction
+            }
+            metadata['fixed_resnet50_params'] = fixed_params
+            # Apply fixed parameters optimized for ResNet-50
+            adaptive_params.update(fixed_params)
+        else:
+            # Use fixed parameters when learning is disabled
+            fixed_params = {
+                'edge_enhancement': 1.3,
+                'smoothing_strength': 0.8,
+                'denoise_strength': 8,
+                'rotation_sensitive': False
+            }
+            metadata['fixed_resnet50_params'] = fixed_params
+            adaptive_params.update(fixed_params)
         
         return processed_image, metadata
     
@@ -689,7 +705,7 @@ class AdvancedPreprocessingPipeline:
 _advanced_pipeline = None
 
 
-def get_advanced_pipeline(enable_learning: bool = True) -> AdvancedPreprocessingPipeline:
+def get_advanced_pipeline(enable_learning: bool = False) -> AdvancedPreprocessingPipeline:
     """
     Get or create global advanced preprocessing pipeline
     
