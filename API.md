@@ -41,20 +41,24 @@ POST /search
 ```
 
 **Form Data**:
+
 - `file` (required): Image file (JPEG, PNG, max 10MB)
 
 **Query Parameters**:
+
 - `top_k` (optional, default: 10): Number of results (1-100)
 - `use_segmented` (optional, default: false): Return segmented image paths
 - `explain_results` (optional, default: false): Include AI explanations
 
 **Example Request**:
+
 ```bash
 curl -X POST "http://localhost:8000/search?top_k=10&explain_results=true" \
   -F "file=@test_leaf.jpg"
 ```
 
 **Example Response (Basic)**:
+
 ```json
 {
   "query_image": "temp/query_1698765432_leaf.jpg",
@@ -76,6 +80,7 @@ curl -X POST "http://localhost:8000/search?top_k=10&explain_results=true" \
 ```
 
 **Example Response (with explanations)**:
+
 ```json
 {
   "results": [
@@ -90,13 +95,68 @@ curl -X POST "http://localhost:8000/search?top_k=10&explain_results=true" \
         "Leaf shape matches closely",
         "Vein structure is similar"
       ],
-      "potential_concerns": [
-        "Query image has slight rotation"
-      ]
+      "potential_concerns": ["Query image has slight rotation"]
     }
   ]
 }
 ```
+
+---
+
+### Improved Search with Learning-to-Rank
+
+Find similar leaf images using FAISS for initial search, then re-rank results using a trained Learning-to-Rank model for better relevance. This endpoint considers multiple factors beyond just visual similarity, including species frequency, source quality, and user interaction patterns.
+
+```http
+POST /search-improved
+```
+
+**Form Data**:
+
+- `file` (required): Image file (JPEG, PNG, max 10MB)
+
+**Query Parameters**:
+
+- `top_k` (optional, default: 10): Number of results (1-100)
+- `use_segmented` (optional, default: false): Return segmented image paths
+- `explain_results` (optional, default: false): Include AI explanations
+
+**Example Request**:
+
+```bash
+curl -X POST "http://localhost:8000/search-improved?top_k=10&explain_results=true" \
+  -F "file=@test_leaf.jpg"
+```
+
+**Example Response**:
+
+```json
+{
+  "query_image": "temp/query_1698765432_leaf.jpg",
+  "results": [
+    {
+      "file_id": 12345,
+      "image_path": "dataset/images/lab/acer_rubrum/ny1234-01-1.jpg",
+      "segmented_path": "dataset/segmented/lab/acer_rubrum/ny1234-01-1.png",
+      "species": "Acer rubrum",
+      "source": "lab",
+      "distance": 0.956
+    }
+  ],
+  "search_time_ms": 65.2, // May be slightly slower due to re-ranking
+  "search_engine": "faiss_with_ltr",
+  "total_results": 10,
+  "similarity_metric": "cosine_with_ltr_reranking"
+}
+```
+
+**Key Differences from Basic Search**:
+
+- Uses the trained_ltr_model.pkl to re-rank results based on multiple features
+- Considers species frequency, image source quality, and other factors
+- May return different ordering than basic similarity search
+- Better relevance for complex queries where visual similarity alone is insufficient
+- Falls back to basic similarity search if the trained model is unavailable
 
 ---
 
@@ -111,12 +171,9 @@ GET /species
 ```
 
 **Response**:
+
 ```json
-[
-  "Acer rubrum",
-  "Quercus alba",
-  "Fagus grandifolia"
-]
+["Acer rubrum", "Quercus alba", "Fagus grandifolia"]
 ```
 
 ### Get Species Images
@@ -128,14 +185,17 @@ GET /species/{species_name}
 ```
 
 **Query Parameters**:
+
 - `limit` (optional, default: 10): Max images to return (1-100)
 
 **Example**:
+
 ```bash
 curl "http://localhost:8000/species/Acer%20rubrum?limit=5"
 ```
 
 **Response**:
+
 ```json
 [
   {
@@ -157,6 +217,7 @@ GET /images/{file_id}
 ```
 
 **Response**:
+
 ```json
 {
   "file_id": 12345,
@@ -178,15 +239,18 @@ POST /species/add
 ```
 
 **Query Parameters**:
+
 - `species_name` (required): Scientific name (e.g., "Acer rubrum")
 - `source` (optional, default: "lab"): "lab" or "field"
 
 **Example**:
+
 ```bash
 curl -X POST "http://localhost:8000/species/add?species_name=Quercus%20montana&source=lab"
 ```
 
 **Response**:
+
 ```json
 {
   "status": "created",
@@ -206,14 +270,17 @@ POST /species/{species_name}/upload
 ```
 
 **Form Data**:
+
 - `original_image` (required): Original leaf image
 - `segmented_image` (optional): Segmented image
 
 **Query Parameters**:
+
 - `source` (optional, default: "lab"): "lab" or "field"
 - `auto_index` (optional, default: true): Auto-index in FAISS
 
 **Example**:
+
 ```bash
 curl -X POST "http://localhost:8000/species/Acer%20rubrum/upload" \
   -F "original_image=@leaf.jpg" \
@@ -223,6 +290,7 @@ curl -X POST "http://localhost:8000/species/Acer%20rubrum/upload" \
 ```
 
 **Response**:
+
 ```json
 {
   "status": "uploaded",
@@ -244,6 +312,7 @@ GET /species/{species_name}/stats
 ```
 
 **Response**:
+
 ```json
 {
   "species": "Acer rubrum",
@@ -265,9 +334,11 @@ DELETE /images/{file_id}
 ```
 
 **Query Parameters**:
+
 - `delete_files` (optional, default: false): Also delete physical files
 
 **Response**:
+
 ```json
 {
   "file_id": 12345,
@@ -290,6 +361,7 @@ POST /data/incremental-index
 ```
 
 **Request Body**:
+
 ```json
 {
   "file_id": 12345,
@@ -301,6 +373,7 @@ POST /data/incremental-index
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -319,10 +392,12 @@ PUT /data/update-index/{file_id}
 ```
 
 **Query Parameters**:
+
 - `new_image_path` (optional): Update image path
 - `new_species` (optional): Update species name
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -341,6 +416,7 @@ DELETE /data/index/{file_id}
 ```
 
 **Response**:
+
 ```json
 {
   "success": true,
@@ -359,6 +435,7 @@ POST /data/sync-index
 ```
 
 **Response**:
+
 ```json
 {
   "message": "Index synchronization complete",
@@ -380,10 +457,12 @@ GET /data/index-changes
 ```
 
 **Query Parameters**:
+
 - `operation` (optional): Filter by operation ("add", "update", "delete", "sync")
 - `limit` (optional, default: 100): Max changes to return (1-1000)
 
 **Response**:
+
 ```json
 {
   "total_changes": 150,
@@ -408,12 +487,15 @@ POST /data/validate
 ```
 
 **Form Data**:
+
 - `file` (required): Image to validate
 
 **Query Parameters**:
+
 - `species` (optional): Expected species (for content check)
 
 **Response**:
+
 ```json
 {
   "valid": true,
@@ -443,6 +525,7 @@ POST /data/validate-batch
 ```
 
 **Request Body**:
+
 ```json
 {
   "image_paths": ["img1.jpg", "img2.jpg", "img3.jpg"]
@@ -450,6 +533,7 @@ POST /data/validate-batch
 ```
 
 **Response**:
+
 ```json
 {
   "statistics": {
@@ -483,13 +567,16 @@ POST /data/augment
 ```
 
 **Form Data**:
+
 - `file` (required): Image to augment
 
 **Query Parameters**:
+
 - `augmentations_count` (optional, default: 5): Number of augmentations (1-20)
 - `profile` (optional, default: "standard"): "minimal", "standard", or "aggressive"
 
 **Response**:
+
 ```json
 {
   "original_filename": "leaf.jpg",
@@ -513,6 +600,7 @@ POST /data/augment-dataset
 ```
 
 **Request Body**:
+
 ```json
 {
   "image_paths": ["img1.jpg", "img2.jpg"],
@@ -523,6 +611,7 @@ POST /data/augment-dataset
 ```
 
 **Response**:
+
 ```json
 {
   "message": "Dataset augmentation complete",
@@ -542,11 +631,13 @@ POST /data/stratified-augmentation
 ```
 
 **Query Parameters**:
+
 - `output_dir` (required): Output directory
 - `target_count` (optional, default: 100): Target images per species (10-1000)
 - `profile` (optional, default: "standard"): Augmentation profile
 
 **Response**:
+
 ```json
 {
   "message": "Stratified augmentation complete",
@@ -570,6 +661,7 @@ GET /cache/stats
 ```
 
 **Response**:
+
 ```json
 {
   "feature_cache": {
@@ -598,9 +690,11 @@ POST /cache/clear
 ```
 
 **Query Parameters**:
+
 - `cache_type` (optional): "feature", "search", or "all" (default: "all")
 
 **Response**:
+
 ```json
 {
   "status": "cleared",
@@ -618,10 +712,12 @@ POST /index/async
 ```
 
 **Query Parameters**:
+
 - `image_path` (required): Path to image
 - `file_id` (required): File ID
 
 **Response**:
+
 ```json
 {
   "task_id": "task_abc123",
@@ -639,6 +735,7 @@ POST /index/async/batch
 ```
 
 **Request Body**:
+
 ```json
 {
   "file_ids": [1, 2, 3],
@@ -647,6 +744,7 @@ POST /index/async/batch
 ```
 
 **Response**:
+
 ```json
 {
   "task_id": "batch_xyz789",
@@ -663,6 +761,7 @@ GET /index/status/{task_id}
 ```
 
 **Response**:
+
 ```json
 {
   "task_id": "task_abc123",
@@ -687,6 +786,7 @@ GET /index/tasks
 ```
 
 **Response**:
+
 ```json
 {
   "tasks": [
@@ -708,6 +808,7 @@ GET /index/stats
 ```
 
 **Response**:
+
 ```json
 {
   "pending_tasks": 5,
@@ -726,6 +827,7 @@ GET /optimization/stats
 ```
 
 **Response**:
+
 ```json
 {
   "caching": {
@@ -758,6 +860,7 @@ GET /health
 ```
 
 **Response**:
+
 ```json
 {
   "status": "healthy",
@@ -778,6 +881,7 @@ GET /stats
 ```
 
 **Response**:
+
 ```json
 {
   "total_images": 30866,
@@ -802,6 +906,7 @@ GET /stats
 All endpoints return standardized error responses:
 
 ### Validation Error (422)
+
 ```json
 {
   "detail": [
@@ -815,6 +920,7 @@ All endpoints return standardized error responses:
 ```
 
 ### Not Found (404)
+
 ```json
 {
   "detail": "Image with file_id 12345 not found"
@@ -822,6 +928,7 @@ All endpoints return standardized error responses:
 ```
 
 ### Server Error (500)
+
 ```json
 {
   "detail": "Internal server error: Feature extraction failed"
@@ -889,13 +996,13 @@ with open('new_leaf.jpg', 'rb') as f:
 ```javascript
 // Search
 const formData = new FormData();
-formData.append('file', fileInput.files[0]);
+formData.append("file", fileInput.files[0]);
 
 const response = await fetch(
-  'http://localhost:8000/search?top_k=10&explain_results=true',
+  "http://localhost:8000/search?top_k=10&explain_results=true",
   {
-    method: 'POST',
-    body: formData
+    method: "POST",
+    body: formData,
   }
 );
 const results = await response.json();
@@ -922,16 +1029,19 @@ curl "http://localhost:8000/stats"
 ## Support & Resources
 
 **Documentation**:
+
 - [README.md](README.md) - Setup and quickstart
 - [FEATURES.md](FEATURES.md) - Detailed features
 - [ARCHITECTURE.md](ARCHITECTURE.md) - Technical architecture
 
 **API**:
+
 - Swagger UI: http://localhost:8000/docs
 - ReDoc: http://localhost:8000/redoc
 - OpenAPI Spec: http://localhost:8000/openapi.json
 
 **System Status**:
+
 - Health: http://localhost:8000/health
 - Stats: http://localhost:8000/stats
 - Cache Stats: http://localhost:8000/cache/stats

@@ -1,0 +1,7 @@
+Learning-to-Rank Model Evaluation Results
+==================================================
+mse: 1.4890337605429482
+mae: 1.1207597255616273
+ndcg: 0.9882750261646077
+correlation: 0.7045524762033069
+num_samples: 4630

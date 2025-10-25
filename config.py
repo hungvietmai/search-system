@@ -53,12 +53,12 @@ class Settings(BaseSettings):
     
     # Preprocessing Optimization Settings (LATEST!)
     enable_preprocessing_cache: bool = True  # Cache preprocessing results
-    preprocessing_cache_ttl: int = 3600  # Preprocessing cache TTL (1 hour)
+    preprocessing_cache_ttl: int = 7200  # Preprocessing cache TTL (2 hours)
     enable_preprocessing_parallel: bool = True  # Parallel preprocessing for batches
-    preprocessing_max_workers: int = 4  # Workers for parallel preprocessing
+    preprocessing_max_workers: int = 6  # Workers for parallel preprocessing
     enable_preprocessing_early_exit: bool = True  # Skip preprocessing for high-quality images
-    preprocessing_quality_threshold_blur: float = 200.0  # Skip if sharper
-    preprocessing_quality_threshold_contrast: float = 50.0  # Skip if higher contrast
+    preprocessing_quality_threshold_blur: float = 150.0  # Skip if sharper (lower threshold for better quality)
+    preprocessing_quality_threshold_contrast: float = 40.0  # Skip if higher contrast (lower threshold for better quality)
     
     # Advanced Preprocessing Algorithm Settings (ADVANCED!)
     enable_advanced_preprocessing: bool = True  # Enable deep learning-inspired algorithms

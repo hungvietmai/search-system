@@ -3,7 +3,7 @@ FastAPI application for Leaf Search System
 """
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+import numpy as np
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 from typing import List, Optional, Dict, Any
@@ -13,17 +13,14 @@ import shutil
 from pathlib import Path
 import logging
 
+from app.preprocessors import PreprocessingProfile
 from config import settings
 from app.database import get_db, init_db, check_db_connection
 from app.schemas import (
-    SearchRequest, SearchResponse, SearchResult,
+    SearchResponse, SearchResult,
     HealthResponse, StatsResponse, SpeciesInfo,
     LeafImageResponse, SearchEngine,
-    FeedbackRequest, FeedbackResponse, FeedbackType,
-    RefineQueryRequest, AdvancedSearchRequest,
-    DiversityAlgorithm as DiversityAlgorithmSchema,
-    LTRAlgorithm as LTRAlgorithmSchema,
-    SimilarityMetricType
+    FeedbackRequest, FeedbackResponse,
 )
 from app.similarity_metrics import SimilarityMetric
 from app.models import LeafImage
@@ -42,6 +39,8 @@ from app.learning_to_rank import (
     LTRAlgorithm,
     RankingFeatures
 )
+from app.similarity_metrics import MetricCalculator
+import pickle
 from app.diversity_ranker import (
     get_diversity_ranker,
     DiversityAlgorithm
@@ -54,7 +53,9 @@ from app.cache import (
 )
 from app.performance_optimizer import (
     get_performance_optimizer,
-    OptimizationConfig
+    OptimizationConfig,
+    ApproximateReranker,
+    BatchProcessor
 )
 from app.advanced_preprocessing import get_advanced_pipeline
 from app.async_indexer import get_async_indexer
@@ -69,6 +70,9 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Global LTR model cache to avoid reloading for every request
+ltr_model_cache = {}
 
 
 @asynccontextmanager
@@ -191,22 +195,27 @@ async def search_similar_leaves(
     top_k: int = Query(10, ge=1, le=100, description="Number of similar images to return"),
     use_segmented: bool = Query(False, description="Return segmented image paths"),
     explain_results: bool = Query(False, description="Include AI explanations for matches"),
+    use_ltr: bool = Query(True, description="Use Learning-to-Rank model to re-rank results"),
+    use_dataset_only: bool = Query(True, description="Use dataset-only optimized search"),
     db: Session = Depends(get_db)
 ):
     """
-    Search for similar leaf images using FAISS with cosine similarity
+    Search for similar leaf images using FAISS with cosine similarity and optional Learning-to-Rank re-ranking
     
-    **Simple & Fast Search**:
+    **Enhanced Search**:
     - Upload a leaf image and get the top-k most similar leaves
-    - Uses FAISS index with cosine similarity (optimized for accuracy)
+    - Uses FAISS index with cosine similarity for initial search
+    - Optionally applies Learning-to-Rank model to re-rank results for better relevance
     - Consistent preprocessing applied to match indexed images
     - Returns species, confidence scores, and similarity distances
     
     **Parameters**:
     - **file**: Leaf image file to search (jpg, png)
-    - **top_k**: Number of results (1-10, default: 10)
+    - **top_k**: Number of results (1-100, default: 10)
     - **use_segmented**: Return segmented/processed images (default: False)
     - **explain_results**: Get AI explanations for why each result matches (default: False)
+    - **use_ltr**: Use Learning-to-Rank model to re-rank results (default: True)
+    - **use_dataset_only**: Use dataset-only optimized search (default: True)
     
     **Response**:
     - List of similar images with species names
@@ -230,10 +239,32 @@ async def search_similar_leaves(
             use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
             use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
         )
-        query_features = feature_extractor.extract_features(
-            temp_file,
-            is_query=True  # This will apply consistent preprocessing
-        )
+        # Check if features are already cached
+        # Create a hash of the file content to use as cache key (not temp path)
+        import hashlib
+        hasher = hashlib.md5()
+        with open(temp_file, "rb") as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                hasher.update(chunk)
+        file_hash = hasher.hexdigest()
+        file_id = int(file_hash[:8], 16)  # Convert first 8 chars to int
+        
+        feature_cache = get_feature_cache()
+        cached_features = feature_cache.get_features(file_id)
+        if cached_features is not None:
+            query_features = cached_features
+            logger.info("Loaded features from cache")
+        else:
+            # For query images, we don't know the source, so we use AUTO profile
+            # which will automatically detect the appropriate preprocessing
+            query_features = feature_extractor.extract_features(
+                temp_file,
+                is_query=True,  # This will apply consistent preprocessing
+                force_normalization=True,  # Ensure consistent normalization
+                preprocessing_profile=PreprocessingProfile.AUTO  # Use AUTO profile for query images to match indexing
+            )
+            # Cache the query features to avoid recomputation
+            feature_cache.set_features(file_id, query_features)
         
         logger.info(f"Extracted features WITH preprocessing (consistent with indexing)")
         
@@ -242,32 +273,190 @@ async def search_similar_leaves(
         if not faiss_client or not faiss_client.loaded:
             raise HTTPException(status_code=503, detail="Search index not available")
         
+        # Determine how many candidates to retrieve based on LTR usage
+        retrieve_k = top_k if not use_ltr else min(top_k * 3, 100)  # Get more candidates for re-ranking if using LTR
+        
         # Always use cosine similarity
         search_metric = SimilarityMetric.COSINE
-        file_ids, distances = faiss_client.search(query_features, top_k, metric=search_metric)
+        file_ids, distances = faiss_client.search(query_features, retrieve_k, metric=search_metric)
         
         logger.info(f"Found {len(file_ids)} results using cosine similarity")
         
-        # Get image metadata from database
+        # Get image metadata from database using bulk fetch (optimized)
+        optimizer = get_performance_optimizer()
+        initial_results = optimizer.optimize_search(file_ids, distances, db, retrieve_k)
+        initial_results = [
+            {
+                'file_id': result['file_id'],
+                'image_path': str(result['image'].image_path),
+                'segmented_path': str(result['image'].segmented_path) if result['image'].segmented_path is not None else None,
+                'species': str(result['image'].species),
+                'source': str(result['image'].source),
+                'distance': result['distance'],
+                'original_index': i
+            }
+            for i, result in enumerate(initial_results)
+        ]
+        
+        # Use two-stage search engine for improved results
+        if use_dataset_only:  # Only use two-stage when dataset-only optimization is enabled
+            two_stage_engine = get_two_stage_engine(adaptive=True)
+            
+            # Define a search function that wraps the FAISS search
+            def faiss_search_wrapper(query_features, k):
+                return faiss_client.search(query_features, k, metric=search_metric)
+            
+            # Define emb_getter function for diversity promotion
+            def emb_getter(fid: int) -> np.ndarray:
+                # Prefer a feature store; fallback to re-extract from disk
+                img = db.query(LeafImage).filter(LeafImage.file_id == fid).first()
+                if not img or not img.image_path:
+                    raise KeyError(fid)
+                return get_feature_extractor(
+                    use_query_segmentation=False,
+                    use_advanced_preprocessing=settings.use_advanced_preprocessing,
+                    use_query_preprocessing=False
+                ).extract_features(img.image_path, is_query=False, force_normalization=True)
+            
+            # Perform two-stage search
+            reranked_candidates = two_stage_engine.search(
+                search_function=faiss_search_wrapper,
+                query_features=query_features,
+                db=db,
+                top_k=top_k,  # Pass plain top_k (engine will handle internal multiplication)
+                promote_diversity=True,
+                emb_getter=emb_getter
+            )
+            
+            # Convert back to our expected format
+            initial_results = []
+            for candidate in reranked_candidates:
+                initial_results.append({
+                    'file_id': candidate.file_id,
+                    'image_path': str(candidate.image_path),
+                    'segmented_path': candidate.segmented_path,
+                    'species': candidate.species,
+                    'source': candidate.source,
+                    'distance': candidate.distance,
+                    'original_index': len(initial_results) # This is just for ordering
+                })
+        
+        # Apply Learning-to-Rank re-ranking if requested and if model exists
+        if use_ltr and use_dataset_only:
+            model_path = Path("data/trained_ltr_model.pkl")
+            cache_key = str(model_path)
+            
+            if model_path.exists():
+                try:
+                    # Load the trained LTR model from global cache if available
+                    if cache_key in ltr_model_cache:
+                        ltr_engine = ltr_model_cache[cache_key]
+                    else:
+                        # Load the trained LTR model
+                        ltr_engine = get_ltr_engine(algorithm=LTRAlgorithm.LINEAR)
+                        
+                        # Load the trained model weights
+                        with open(model_path, 'rb') as f:
+                            saved_data = pickle.load(f)
+                        
+                        # Determine model type and restore weights
+                        if isinstance(saved_data, dict) and 'weights' in saved_data:
+                            if saved_data['algorithm'] == 'linear':
+                                from app.learning_to_rank import LinearLTR
+                                ltr_engine.model = LinearLTR(weights=saved_data['weights'])
+                                ltr_engine.algorithm = LTRAlgorithm.LINEAR
+                            elif saved_data['algorithm'] == 'ranknet':
+                                from app.learning_to_rank import PairwiseLTR
+                                ltr_engine.model = PairwiseLTR()
+                                ltr_engine.model.weights = saved_data['weights']
+                                ltr_engine.algorithm = LTRAlgorithm.RANKNET
+                        else:
+                            # For backward compatibility with simple weights
+                            ltr_engine.model.weights = saved_data
+                        
+                        # Cache the loaded model globally
+                        ltr_model_cache[cache_key] = ltr_engine
+                    
+                    # Create ranking features for each candidate
+                    ranking_features_list = []
+                    candidate_info_list = []
+                    
+                    # Extract features for all candidates using database metadata only (no batch processing needed)
+                    # Cache species count and total images to avoid repeated queries
+                    species_cache, total_images = {}, db.query(LeafImage).count()
+                    
+                    for result in initial_results:
+                        # Calculate similarity metrics between query and candidate
+                        # Use precomputed distances as fallback if needed
+                        vector_similarity = 1.0 / (1.0 + result['distance'])  # Convert distance to similarity
+                        cosine_similarity = 1.0 / (1.0 + result['distance'])
+                        retrieval_distance = result['distance']  # Using generic name since FAISS uses cosine
+                        
+                        # Get additional information from database for ranking features
+                        species_key = result['species']
+                        species_count = species_cache.get(species_key) or db.query(LeafImage).filter(LeafImage.species == species_key).count()
+                        species_cache[species_key] = species_count
+                        species_frequency = species_count / total_images if total_images else 0.5
+                        
+                        # Source score (lab=1.0, field=0.5)
+                        source_score = 1.0 if result['source'] == 'lab' else 0.5
+                        
+                        # Create ranking features
+                        ranking_features = RankingFeatures(
+                            vector_similarity=vector_similarity,
+                            cosine_similarity=cosine_similarity,
+                            euclidean_distance=retrieval_distance,  # Using generic name since FAISS uses cosine
+                            species_frequency=species_frequency,
+                            species_popularity=species_frequency,  # Using frequency as popularity proxy
+                            image_quality_score=0.8,  # Default quality score
+                            source_score=source_score,
+                            temporal_score=0.5,  # Default temporal score
+                            diversity_score=0.5,  # Default diversity score
+                            click_through_rate=0.1,  # Default CTR
+                            conversion_rate=0.1   # Default conversion rate
+                        )
+                        
+                        ranking_features_list.append(ranking_features)
+                        candidate_info_list.append(result)
+                    
+                    # Use the trained LTR model to re-rank the results
+                    ranked_indices = ltr_engine.model.rank(ranking_features_list)
+                    # Reorder results based on LTR ranking
+                    reranked_results = [candidate_info_list[i] for i in ranked_indices]
+                    
+                    # Take only top_k results after re-ranking
+                    final_results = reranked_results[:top_k]
+                    
+                except Exception as e:
+                    logger.warning(f"LTR re-ranking failed: {e}, falling back to original ranking")
+                    # If LTR fails, use original FAISS ranking
+                    final_results = initial_results[:top_k]
+            else:
+                logger.info("LTR model not found, using original FAISS ranking")
+                # If model doesn't exist, use original ranking
+                final_results = initial_results[:top_k]
+        else:
+            # If LTR is not requested, use original ranking
+            final_results = initial_results[:top_k]
+        
+        # Convert to SearchResult format
         results = []
-        for file_id, distance in zip(file_ids, distances):
-            image = db.query(LeafImage).filter(LeafImage.file_id == file_id).first()
-            if image:
-                seg_path = str(image.segmented_path) if image.segmented_path is not None else None
-                results.append(SearchResult(
-                    file_id=int(image.file_id),  # type: ignore
-                    image_path=seg_path if use_segmented and seg_path else str(image.image_path),
-                    segmented_path=seg_path,
-                    species=str(image.species),
-                    source=str(image.source),
-                    distance=float(distance),
-                    confidence_score=None,
-                    confidence_level=None,
-                    explanation=None,
-                    explanation_components=None,
-                    visual_similarities=None,
-                    potential_concerns=None
-                ))
+        for result in final_results:
+            seg_path = str(result['segmented_path']) if result['segmented_path'] is not None else None
+            results.append(SearchResult(
+                file_id=result['file_id'],
+                image_path=seg_path if use_segmented and seg_path else str(result['image_path']),
+                segmented_path=seg_path,
+                species=result['species'],
+                source=result['source'],
+                distance=result['distance'],
+                confidence_score=None,
+                confidence_level=None,
+                explanation=None,
+                explanation_components=None,
+                visual_similarities=None,
+                potential_concerns=None
+            ))
         
         # Add AI explanations if requested
         if explain_results and results:
@@ -312,10 +501,10 @@ async def search_similar_leaves(
             query_image=str(temp_file),
             results=results,
             search_time_ms=search_time,
-            search_engine="faiss",
+            search_engine="faiss_with_ltr" if use_ltr else "faiss",
             total_results=len(results),
             query_preprocessing_applied=True,
-            similarity_metric="cosine"
+            similarity_metric="cosine_with_ltr_reranking" if use_ltr else "cosine"
         )
         
     except HTTPException:
@@ -529,9 +718,13 @@ async def upload_species_images(
                     use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
                     use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
                 )
+                # Use AUTO profile which will automatically select LAB/FIELD based on source
+                profile = PreprocessingProfile.LAB if source == 'lab' else PreprocessingProfile.FIELD
                 features = feature_extractor.extract_features(
                     str(abs_path),
-                    is_query=False # Apply consistent preprocessing for dataset images
+                    is_query=False, # Apply consistent preprocessing for dataset images
+                    force_normalization=True,  # Ensure consistent normalization
+                    preprocessing_profile=profile  # Use appropriate profile for dataset images to match indexing
                 )
                 
                 # Index based on search engine
@@ -814,10 +1007,28 @@ async def refine_search_with_feedback(
             use_advanced_preprocessing=settings.use_advanced_preprocessing, # Use advanced preprocessing
             use_query_preprocessing=False # Disable redundant query preprocessing to avoid conflicts
         )
-        query_vector = feature_extractor.extract_features(
-            temp_file,
-            is_query=True # Apply consistent preprocessing
-        )
+        # Check if features are already cached
+        # Create a hash of the file path to use as cache key
+        import hashlib
+        file_hash = hashlib.md5(str(temp_file).encode()).hexdigest()
+        file_id = int(file_hash[:8], 16) # Convert first 8 chars to int
+        
+        feature_cache = get_feature_cache()
+        cached_features = feature_cache.get_features(file_id)
+        if cached_features is not None:
+            query_vector = cached_features
+            logger.info("Loaded features from cache")
+        else:
+            # For query images, we don't know the source, so we use AUTO profile
+            # which will automatically detect the appropriate preprocessing
+            query_vector = feature_extractor.extract_features(
+                temp_file,
+                is_query=True, # Apply consistent preprocessing
+                force_normalization=True,  # Ensure consistent normalization
+                preprocessing_profile=PreprocessingProfile.AUTO  # Use AUTO profile for query images to match indexing
+            )
+            # Cache the query features to avoid recomputation
+            feature_cache.set_features(file_id, query_vector)
         
         # Function to get vector for file_id
         def get_vector_for_file(file_id: int):
@@ -1633,6 +1844,305 @@ async def stratified_augmentation(
     except Exception as e:
         logger.error(f"Stratified augmentation failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# New optimized search endpoint for dataset-only data
+@app.post("/search-optimized", response_model=SearchResponse, tags=["Search"])
+async def search_similar_leaves_optimized(
+    file: UploadFile = File(...),
+    top_k: int = Query(10, ge=1, le=100, description="Number of similar images to return"),
+    use_segmented: bool = Query(False, description="Return segmented image paths"),
+    explain_results: bool = Query(False, description="Include AI explanations for matches"),
+    use_ltr: bool = Query(True, description="Use Learning-to-Rank model to re-rank results"),
+    db: Session = Depends(get_db)
+):
+    """
+    Optimized search for dataset-only data using FAISS with cosine similarity and optional Learning-to-Rank re-ranking
+    
+    **Optimized Search**:
+    - Uses pre-computed features and optimized database queries
+    - Applies approximate re-ranking for large result sets
+    - Uses dataset-specific optimizations for faster performance
+    - Returns species, confidence scores, and similarity distances
+    
+    **Parameters**:
+    - **file**: Leaf image file to search (jpg, png)
+    - **top_k**: Number of results (1-100, default: 10)
+    - **use_segmented**: Return segmented/processed images (default: False)
+    - **explain_results**: Get AI explanations for why each result matches (default: False)
+    - **use_ltr**: Use Learning-to-Rank model to re-rank results (default: True)
+    
+    **Response**:
+    - List of similar images with species names
+    - Similarity scores (higher = more similar for cosine)
+    - Search time in milliseconds
+    - Optional: Detailed explanations and confidence analysis
+    """
+    temp_file = None
+    start_time = time.time()
+    
+    try:
+        # Save uploaded file temporarily
+        temp_file = Path(settings.temp_dir) / f"query_{int(time.time())}_{file.filename}"
+        with open(temp_file, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        
+        # Extract features with optimized preprocessing for dataset consistency
+        # Use caching to avoid recomputing features for the same image
+        feature_extractor = get_feature_extractor(
+            use_query_segmentation=True,  # Enable background removal for query images
+            use_advanced_preprocessing=settings.use_advanced_preprocessing,
+            use_query_preprocessing=False
+        )
+        
+        # Check if features are already cached
+        import hashlib
+        file_hash = hashlib.md5(str(temp_file).encode()).hexdigest()
+        file_id = int(file_hash[:8], 16)  # Convert first 8 chars to int
+        
+        feature_cache = get_feature_cache()
+        cached_features = feature_cache.get_features(file_id)
+        if cached_features is not None:
+            query_features = cached_features
+            logger.info("Loaded query features from cache")
+        else:
+            # For query images, we don't know the source, so we use AUTO profile
+            query_features = feature_extractor.extract_features(
+                temp_file,
+                is_query=True,
+                force_normalization=True,
+                preprocessing_profile=PreprocessingProfile.AUTO
+            )
+            # Cache the query features to avoid recomputation
+            feature_cache.set_features(file_id, query_features)
+        
+        logger.info(f"Extracted query features with preprocessing")
+        
+        # Search using FAISS with cosine similarity
+        faiss_client = get_faiss_client()
+        if not faiss_client or not faiss_client.loaded:
+            raise HTTPException(status_code=503, detail="Search index not available")
+        
+        # Determine how many candidates to retrieve based on LTR usage
+        retrieve_k = top_k if not use_ltr else min(top_k * 3, 100)
+        
+        # Use cosine similarity
+        search_metric = SimilarityMetric.COSINE
+        file_ids, distances = faiss_client.search(query_features, retrieve_k, metric=search_metric)
+        
+        logger.info(f"Found {len(file_ids)} results using cosine similarity")
+        
+        # Use performance optimizer for bulk database fetch with caching
+        optimizer = get_performance_optimizer()
+        search_results = optimizer.optimize_search(file_ids, distances, db, retrieve_k)
+        
+        # Prepare initial results with better structure
+        initial_results = []
+        for i, result in enumerate(search_results):
+            img = result['image']
+            seg_path = str(img.segmented_path) if img.segmented_path is not None else None
+            initial_results.append({
+                'file_id': result['file_id'],
+                'image_path': seg_path if use_segmented and seg_path else str(img.image_path),
+                'segmented_path': seg_path,
+                'species': str(img.species),
+                'source': str(img.source),
+                'distance': result['distance'],
+                'original_index': i
+            })
+        
+        # Apply Learning-to-Rank re-ranking if requested and model exists
+        if use_ltr:
+            model_path = Path("data/trained_ltr_model.pkl")
+            if model_path.exists():
+                try:
+                    # Load the trained LTR model
+                    ltr_engine = get_ltr_engine(algorithm=LTRAlgorithm.LINEAR)
+                    
+                    # Load the trained model weights
+                    with open(model_path, 'rb') as f:
+                        saved_data = pickle.load(f)
+                    
+                    # Determine model type and restore weights
+                    if isinstance(saved_data, dict) and 'weights' in saved_data:
+                        if saved_data['algorithm'] == 'linear':
+                            from app.learning_to_rank import LinearLTR
+                            ltr_engine.model = LinearLTR(weights=saved_data['weights'])
+                            ltr_engine.algorithm = LTRAlgorithm.LINEAR
+                        elif saved_data['algorithm'] == 'ranknet':
+                            from app.learning_to_rank import PairwiseLTR
+                            ltr_engine.model = PairwiseLTR()
+                            ltr_engine.model.weights = saved_data['weights']
+                            ltr_engine.algorithm = LTRAlgorithm.RANKNET
+                    else:
+                        # For backward compatibility with simple weights
+                        ltr_engine.model.weights = saved_data
+                    
+                    # Create ranking features for each candidate
+                    ranking_features_list = []
+                    candidate_info_list = []
+                    
+                    # Use approximate re-ranking for large result sets
+                    approx_reranker = ApproximateReranker(
+                        sampling_threshold=settings.sampling_threshold,
+                        sampling_ratio=settings.sampling_ratio,
+                        min_samples=settings.min_samples
+                    )
+                    
+                    # Cache species count and total images to avoid repeated queries
+                    species_cache, total_images = {}, db.query(LeafImage).count()
+                    
+                    for result in initial_results:
+                       # Use precomputed distances and basic features for efficiency
+                       vector_similarity = 1.0 / (1.0 + result['distance'])  # Convert distance to similarity
+                       cosine_similarity = 1.0 / (1.0 + result['distance'])
+                       retrieval_distance = result['distance']  # Using generic name since FAISS uses cosine
+                       
+                       # Get additional information from database for ranking features
+                       species_key = result['species']
+                       species_count = species_cache.get(species_key) or db.query(LeafImage).filter(LeafImage.species == species_key).count()
+                       species_cache[species_key] = species_count
+                       species_frequency = species_count / total_images if total_images else 0.5
+                       
+                       # Source score (lab=1.0, field=0.5)
+                       source_score = 1.0 if result['source'] == 'lab' else 0.5
+                       
+                       # Create ranking features
+                       ranking_features = RankingFeatures(
+                           vector_similarity=vector_similarity,
+                           cosine_similarity=cosine_similarity,
+                           euclidean_distance=retrieval_distance,  # Using generic name since FAISS uses cosine
+                           species_frequency=species_frequency,
+                           species_popularity=species_frequency,
+                           image_quality_score=0.8,
+                           source_score=source_score,
+                           temporal_score=0.5,
+                           diversity_score=0.5,
+                           click_through_rate=0.1,
+                           conversion_rate=0.1
+                       )
+                       
+                       ranking_features_list.append(ranking_features)
+                       candidate_info_list.append(result)
+                    
+                    # Use approximate re-ranking if enabled and threshold is met
+                    if (settings.enable_approximate_reranking and
+                        approx_reranker.should_use_sampling(len(ranking_features_list))):
+                        
+                        # Create initial scores from original distances (inverted)
+                        initial_scores = [1.0 / (dist + 1e-8) for dist in [r['distance'] for r in initial_results]]
+                        
+                        # Perform approximate re-ranking using the LTR model for scoring
+                        reranked_candidates, reranked_scores = approx_reranker.rerank_with_sampling(
+                            candidate_info_list,
+                            initial_scores,
+                            lambda candidates, **kwargs: (candidates, [ltr_engine.model.score(ranking_features_list[candidate_info_list.index(c)]) for c in candidates])
+                        )
+                        
+                        # Use the results from approximate re-ranking
+                        reranked_results = reranked_candidates
+                    else:
+                        # Use full re-ranking for smaller result sets
+                        ranked_indices = ltr_engine.model.rank(ranking_features_list)
+                        reranked_results = [candidate_info_list[i] for i in ranked_indices]
+                    
+                    # Take only top_k results after re-ranking
+                    final_results = reranked_results[:top_k]
+                    
+                except Exception as e:
+                    logger.warning(f"LTR re-ranking failed: {e}, falling back to original ranking")
+                    # If LTR fails, use original FAISS ranking
+                    final_results = initial_results[:top_k]
+            else:
+                logger.info("LTR model not found, using original FAISS ranking")
+                # If model doesn't exist, use original ranking
+                final_results = initial_results[:top_k]
+        else:
+            # If LTR is not requested, use original ranking
+            final_results = initial_results[:top_k]
+        
+        # Convert to SearchResult format
+        results = []
+        for result in final_results:
+            results.append(SearchResult(
+                file_id=result['file_id'],
+                image_path=result['image_path'],
+                segmented_path=result['segmented_path'],
+                species=result['species'],
+                source=result['source'],
+                distance=result['distance'],
+                confidence_score=None,
+                confidence_level=None,
+                explanation=None,
+                explanation_components=None,
+                visual_similarities=None,
+                potential_concerns=None
+            ))
+        
+        # Add AI explanations if requested
+        if explain_results and results:
+            explainer = get_result_explainer()
+            
+            result_dicts = [
+                {
+                    'file_id': r.file_id,
+                    'species': r.species,
+                    'source': r.source,
+                    'distance': r.distance
+                }
+                for r in results
+            ]
+            
+            explanations = explainer.explain_top_results(
+                result_dicts,
+                query_features,
+                db
+            )
+            
+            for result, explanation in zip(results, explanations):
+                result.confidence_score = explanation.confidence_score
+                result.confidence_level = explanation.confidence_level.value
+                result.explanation = explanation.overall_explanation
+                result.explanation_components = [
+                    {
+                        'factor': c.factor,
+                        'score': c.score,
+                        'weight': c.weight,
+                        'description': c.description,
+                        'contribution': c.contribution
+                    }
+                    for c in explanation.components
+                ]
+                result.visual_similarities = explanation.visual_similarities
+                result.potential_concerns = explanation.potential_concerns
+        
+        search_time = (time.time() - start_time) * 1000  # Convert to ms
+        
+        # Log performance metrics
+        logger.info(f"Search completed in {search_time:.2f}ms with {len(results)} results")
+        
+        return SearchResponse(
+            query_image=str(temp_file),
+            results=results,
+            search_time_ms=search_time,
+            search_engine="faiss_optimized_with_ltr" if use_ltr else "faiss_optimized",
+            total_results=len(results),
+            query_preprocessing_applied=True,
+            similarity_metric="cosine_with_ltr_reranking" if use_ltr else "cosine"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Optimized search failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Optimized search failed: {str(e)}")
+    finally:
+        # Cleanup temp file
+        if temp_file and temp_file.exists():
+            try:
+                temp_file.unlink()
+            except Exception as e:
+                logger.warning(f"Failed to cleanup temp file: {e}")
 
 
 if __name__ == "__main__":

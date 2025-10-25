@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import Enum
 import logging
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 
 from app.models import LeafImage
 
@@ -20,9 +21,8 @@ logger = logging.getLogger(__name__)
 class ReRankingCriterion(Enum):
     """Re-ranking criteria"""
     VECTOR_SIMILARITY = "vector_similarity"
-    SPECIES_FREQUENCY = "species_frequency"
+    SPECIES_PRIOR = "species_prior"
     IMAGE_SOURCE_PREFERENCE = "image_source"
-    TEMPORAL_RELEVANCE = "temporal"
     DIVERSITY = "diversity"
 
 
@@ -55,7 +55,7 @@ class TwoStageSearchEngine:
     """
     
     def __init__(self, 
-                 retrieval_multiplier: int = 3,
+                 retrieval_multiplier: int = 5,
                  weights: Optional[Dict[str, float]] = None):
         """
         Initialize two-stage search engine
@@ -68,10 +68,10 @@ class TwoStageSearchEngine:
         
         # Default weights for re-ranking criteria
         self.weights = weights or {
-            'vector_similarity': 0.6,    # Primary: vector similarity
-            'species_frequency': 0.15,   # Prefer common species
-            'source_preference': 0.15,   # Prefer lab images
-            'diversity': 0.10            # Species diversity
+            'vector_similarity': 0.70,
+            'species_prior':     0.05,  # small nudge, tempered IDF
+            'source_preference': 0.15,  # prefer inferred domain
+            'diversity':         0.00,  # handled by MMR
         }
         
         # Normalize weights
@@ -105,9 +105,10 @@ class TwoStageSearchEngine:
         
         return file_ids, distances
     
-    def compute_vector_similarity_scores(self, distances: List[float]) -> List[float]:
+    def to_similarities(self, distances: List[float]) -> List[float]:
         """
-        Convert distances to similarity scores (0-1, higher is better)
+        Convert distances to similarity scores using temperatured softmax
+        More robust than min-max normalization when distance spreads are tiny
         
         Args:
             distances: L2 distances from vector search
@@ -115,171 +116,200 @@ class TwoStageSearchEngine:
         Returns:
             Similarity scores
         """
-        distances_array = np.array(distances)
-        
-        # Convert to similarities (inverse distance)
-        # Add small epsilon to avoid division by zero
-        similarities = 1.0 / (distances_array + 1e-6)
-        
-        # Normalize to 0-1 range
-        if len(similarities) > 1:
-            min_sim = similarities.min()
-            max_sim = similarities.max()
-            if max_sim > min_sim:
-                similarities = (similarities - min_sim) / (max_sim - min_sim)
-            else:
-                similarities = np.ones_like(similarities)
-        else:
-            similarities = np.array([1.0])
-        
-        return similarities.tolist()
+        d = np.array(distances, dtype=np.float32)
+        # Robust temperature from IQR (fall back if degenerate)
+        q1, q3 = np.percentile(d, [25, 75])
+        iqr = max(q3 - q1, 1e-6)
+        T = 0.25 * iqr  # smaller T => peakier when neighbors are clearly separated
+        sims = np.exp(-(d - d.min()) / max(T, 1e-6))
+        sims /= sims.sum() + 1e-9
+        return sims.tolist()
     
-    def compute_species_frequency_scores(self,
-                                         candidates: List[SearchCandidate],
-                                         db: Session) -> List[float]:
+    def compute_species_idf_scores(self, candidates: List[SearchCandidate], db: Session, alpha: float = 0.3) -> List[float]:
         """
-        Compute scores based on species frequency in database
-        More common species get higher scores (assuming better data quality)
+        Compute scores based on inverse species frequency (IDF-like) in database
+        Less common species get higher scores (rarer species are more distinctive)
+        Batched to avoid N DB round-trips.
         
         Args:
             candidates: List of search candidates
             db: Database session
+            alpha: Tempering parameter (lower = less influence)
             
         Returns:
-            Frequency scores
+            Inverse frequency scores
         """
-        # Get species counts
-        species_counts = {}
-        for candidate in candidates:
-            if candidate.species not in species_counts:
-                # Query database for species count
-                count = db.query(LeafImage).filter(
-                    LeafImage.species == candidate.species
-                ).count()
-                species_counts[candidate.species] = count
-        
-        # Convert to scores
-        if species_counts:
-            max_count = max(species_counts.values())
-            min_count = min(species_counts.values())
-            
-            scores = []
-            for candidate in candidates:
-                count = species_counts[candidate.species]
-                if max_count > min_count:
-                    # Normalize to 0-1
-                    score = (count - min_count) / (max_count - min_count)
-                    # Apply logarithmic scaling to reduce bias
-                    score = np.log1p(score * 10) / np.log1p(10)
-                else:
-                    score = 0.5
-                scores.append(score)
+        # batch query counts for candidate species
+        sp_set = {c.species for c in candidates}
+        rows = (db.query(LeafImage.species, func.count(LeafImage.species))
+                  .filter(LeafImage.species.in_(sp_set))
+                  .group_by(LeafImage.species).all())
+        counts = {sp: cnt for sp, cnt in rows}
+        maxc = max(counts.values()) if counts else 1
+        # idf = log(1 + max_count / count) -> higher for rarer species
+        idf = {sp: np.log1p(maxc / max(counts.get(sp, 1), 1)) for sp in sp_set}
+        vals = np.array([idf[c.species] for c in candidates], dtype=np.float32)
+        # normalize to 0..1 and temper so prior never dominates
+        vmax, vmin = float(vals.max()), float(vals.min())
+        if vmax > vmin:
+            vals = (vals - vmin) / (vmax - vmin)
         else:
-            scores = [0.5] * len(candidates)
-        
+            vals = np.full_like(vals, 0.5)
+        scores = (vals ** alpha).tolist()
         return scores
     
-    def compute_source_preference_scores(self,
-                                         candidates: List[SearchCandidate],
-                                         prefer_source: str = "lab") -> List[float]:
+    def infer_query_domain(self, query_features: np.ndarray, nn_sources: List[str]) -> str:
         """
-        Compute scores based on image source preference
-        Lab images are typically higher quality
+        Infer the query domain based on nearest neighbor sources or feature characteristics
+        Field photos are more common in production, so we bias toward field if uncertain
+        
+        Args:
+            query_features: Query feature vector
+            nn_sources: List of sources for nearest neighbors
+            
+        Returns:
+            Inferred domain ('lab' or 'field')
+        """
+        # simple majority vote of top-N neighbor sources, fallback to feature spread
+        if nn_sources:
+            return 'field' if nn_sources.count('field') >= nn_sources.count('lab') else 'lab'
+        return 'field' if np.std(query_features) < 0.2 else 'lab'
+
+    def compute_source_scores(self, candidates: List[SearchCandidate], prefer: str, seg_conf: Optional[Dict[int, float]] = None) -> List[float]:
+        """
+        Compute scores based on image source and quality signals
+        Can adjust preference based on query domain and quality
         
         Args:
             candidates: List of search candidates
-            prefer_source: Preferred source ('lab' or 'field')
+            prefer: Preferred source ('lab' or 'field')
+            seg_conf: Optional segmentation confidence scores
             
         Returns:
-            Source preference scores
+            Source scores
         """
-        scores = []
-        for candidate in candidates:
-            if candidate.source == prefer_source:
-                scores.append(1.0)
-            else:
-                scores.append(0.5)  # Don't completely exclude other source
-        
-        return scores
+        out = []
+        for c in candidates:
+            base = 1.0 if c.source == prefer else 0.7
+            if seg_conf and c.file_id in seg_conf:
+                # nudge by segmentation/quality (bounded)
+                base *= 0.9 + 0.2 * np.clip(seg_conf[c.file_id], 0, 1)
+            out.append(float(min(base, 1.0)))
+        return out
     
-    def compute_diversity_scores(self, candidates: List[SearchCandidate]) -> List[float]:
+    def mmr_rerank(self, cands: List[SearchCandidate], rel: np.ndarray, emb_getter: Callable[[int], np.ndarray], lam: float = 0.7, start_at: int = 3, k: Optional[int]=None):
         """
-        Promote diversity in search results
-        Penalize duplicate species in top results
-        
+        Maximal Marginal Relevance re-ranking to promote diversity
+        Balances relevance and dissimilarity to avoid near-duplicates
+         
         Args:
-            candidates: List of search candidates
-            
+            cands: List of search candidates
+            rel: Precomputed relevance per candidate (e.g., vector similarities)
+            emb_getter: Function to get embedding for a file_id
+            lam: Balance between relevance and diversity (higher = more relevance)
+            start_at: Start penalizing diversity after this rank (don't penalize top-3)
+            k: Number of results to return (default: all)
+             
         Returns:
-            Diversity scores
+            Re-ranked list of candidates
         """
-        species_seen = {}
-        scores = []
-        
-        for candidate in candidates:
-            species = candidate.species
-            
-            if species not in species_seen:
-                # First occurrence of this species
-                scores.append(1.0)
-                species_seen[species] = 1
+        import numpy as np
+        k = k or len(cands)
+        picked, remaining = [], list(range(len(cands)))
+        # Precompute embeddings for cosine dissimilarity
+        Em = np.stack([emb_getter(c.file_id) for c in cands]).astype(np.float32)
+        Em /= np.linalg.norm(Em, axis=1, keepdims=True) + 1e-9
+        S = Em @ Em.T  # cosine similarity
+        for t in range(k):
+            if t < start_at:
+                idx = max(remaining, key=lambda i: rel[i])
             else:
-                # Penalize repeated species
-                count = species_seen[species]
-                # Exponential decay: 1.0, 0.7, 0.5, 0.3, ...
-                score = max(0.1, 1.0 / (1.5 ** count))
-                scores.append(score)
-                species_seen[species] = count + 1
-        
-        return scores
+                idx = max(remaining, key=lambda i: lam * rel[i] - (1 - lam) * (max(S[i, picked]) if picked else 0.0))
+            picked.append(idx); remaining.remove(idx)
+        return [cands[i] for i in picked]
     
     def stage2_reranking(self,
                         candidates: List[SearchCandidate],
+                        query_features: np.ndarray,
                         db: Session,
-                        prefer_source: str = "lab",
-                        promote_diversity: bool = True) -> List[SearchCandidate]:
+                        prefer_source: Optional[str] = None,
+                        promote_diversity: bool = True,
+                        emb_getter: Optional[Callable[[int], np.ndarray]] = None) -> List[SearchCandidate]:
         """
         Stage 2: Re-rank candidates using multiple criteria
-        
+         
         Args:
             candidates: List of search candidates from stage 1
+            query_features: Query feature vector for domain inference
             db: Database session
-            prefer_source: Preferred image source
+            prefer_source: Preferred image source ("lab", "field", or None/"auto" to infer)
             promote_diversity: Whether to promote species diversity
-            
+            emb_getter: Function to get embedding for a file_id (required when promote_diversity=True)
+             
         Returns:
             Re-ranked candidates
         """
         if not candidates:
             return candidates
-        
+         
         logger.info(f"Stage 2: Re-ranking {len(candidates)} candidates")
-        
+         
         # Compute individual scores
         vector_scores = [c.vector_score for c in candidates]
         
-        frequency_scores = self.compute_species_frequency_scores(candidates, db)
+        idf_scores = self.compute_species_idf_scores(candidates, db)
         
-        source_scores = self.compute_source_preference_scores(candidates, prefer_source)
+        # Use provided prefer_source or infer if needed
+        pref = prefer_source if prefer_source in {"lab", "field"} else \
+               self.infer_query_domain(query_features, [c.source for c in candidates[:min(5, len(candidates))]])
         
-        diversity_scores = self.compute_diversity_scores(candidates) if promote_diversity else [1.0] * len(candidates)
+        # Compute source scores based on preferred source
+        source_scores = self.compute_source_scores(candidates, pref)
         
-        # Combine scores using weights
-        for i, candidate in enumerate(candidates):
-            candidate.frequency_score = frequency_scores[i]
-            candidate.source_score = source_scores[i]
-            candidate.diversity_score = diversity_scores[i]
-            
-            # Compute weighted final score
-            candidate.final_score = (
-                self.weights['vector_similarity'] * vector_scores[i] +
-                self.weights['species_frequency'] * frequency_scores[i] +
-                self.weights['source_preference'] * source_scores[i] +
-                self.weights['diversity'] * diversity_scores[i]
-            )
+        # Compute diversity scores using MMR approach
+        diversity_scores = [1.0] * len(candidates)  # Placeholder since MMR handles diversity differently
         
-        # Sort by final score (descending)
-        reranked = sorted(candidates, key=lambda c: c.final_score, reverse=True)
+        # Combine scores using weights to create relevance vector for MMR
+        rel = (
+            self.weights['vector_similarity'] * np.array(vector_scores) +
+            self.weights['species_prior']      * np.array(idf_scores) +
+            self.weights['source_preference']  * np.array(source_scores)
+        )
+        
+        # Create mapping by file_id to handle index mismatch after MMR
+        idx_by_id = {c.file_id: i for i, c in enumerate(candidates)}
+        rel_by_id = {c.file_id: float(rel[idx_by_id[c.file_id]]) for c in candidates}
+        idf_by_id = {c.file_id: float(idf_scores[idx_by_id[c.file_id]]) for c in candidates}
+        src_by_id = {c.file_id: float(source_scores[idx_by_id[c.file_id]]) for c in candidates}
+        
+        # Apply MMR re-ranking if diversity is promoted
+        if promote_diversity:
+            if emb_getter is None:
+                raise ValueError("emb_getter is required when promote_diversity=True")
+            # Use the combined relevance scores for MMR
+            reranked = self.mmr_rerank(candidates, rel, emb_getter, lam=0.7, start_at=3, k=len(candidates))
+            # Update scores based on the original candidate indices
+            for c in reranked:
+                i = idx_by_id[c.file_id]
+                c.final_score = rel_by_id[c.file_id]
+                c.frequency_score = idf_by_id[c.file_id]
+                c.source_score = src_by_id[c.file_id]
+                c.diversity_score = 1.0  # MMR handles diversity explicitly
+        else:
+            # If not promoting diversity, compute final scores and sort by them
+            for i, candidate in enumerate(candidates):
+                candidate.frequency_score = idf_scores[i]
+                candidate.source_score = source_scores[i]
+                candidate.diversity_score = diversity_scores[i]
+                
+                # Compute weighted final score
+                candidate.final_score = (
+                    self.weights['vector_similarity'] * vector_scores[i] +
+                    self.weights['species_prior'] * idf_scores[i] +
+                    self.weights['source_preference'] * source_scores[i] +
+                    self.weights['diversity'] * diversity_scores[i]
+                )
+            reranked = sorted(candidates, key=lambda c: c.final_score, reverse=True)
         
         logger.info(f"Re-ranking complete. Top candidate: {reranked[0].species} (score: {reranked[0].final_score:.4f})")
         
@@ -291,35 +321,37 @@ class TwoStageSearchEngine:
               db: Session,
               top_k: int = 10,
               prefer_source: str = "lab",
-              promote_diversity: bool = True) -> List[SearchCandidate]:
+              promote_diversity: bool = True,
+              emb_getter: Optional[Callable[[int], np.ndarray]] = None) -> List[SearchCandidate]:
         """
         Perform complete two-stage search
-        
+         
         Args:
             search_function: Vector search function
             query_features: Query feature vector
             db: Database session
             top_k: Number of results to return
-            prefer_source: Preferred image source
+            prefer_source: Preferred image source ("lab", "field", or None/"auto" to infer)
             promote_diversity: Whether to promote diversity
-            
+            emb_getter: Function to get embedding for a file_id (required when promote_diversity=True)
+             
         Returns:
             Top-K re-ranked candidates
         """
         # Stage 1: Retrieve candidates
         file_ids, distances = self.stage1_retrieval(search_function, query_features, top_k)
-        
+         
         if not file_ids:
             return []
-        
+         
         # Convert to SearchCandidate objects
         candidates = []
-        vector_scores = self.compute_vector_similarity_scores(distances)
-        
+        vector_scores = self.to_similarities(distances)
+         
         for file_id, distance, vector_score in zip(file_ids, distances, vector_scores):
             # Get image metadata from database
             image = db.query(LeafImage).filter(LeafImage.file_id == file_id).first()
-            
+             
             if image:
                 candidate = SearchCandidate(
                     file_id=int(image.file_id),  # type: ignore
@@ -333,15 +365,27 @@ class TwoStageSearchEngine:
                     vector_score=vector_score
                 )
                 candidates.append(candidate)
-        
+         
         # Stage 2: Re-rank candidates
+        # Use provided prefer_source or infer if needed
+        pref = prefer_source
+        if pref not in {"lab", "field"}:
+            pref = self.infer_query_domain(query_features, [c.source for c in candidates[:min(5, len(candidates))]])
+        
+        # Use provided emb_getter or raise if needed
+        emb_get = emb_getter
+        if promote_diversity and emb_get is None:
+            raise ValueError("emb_getter is required when promote_diversity=True")
+        
         reranked = self.stage2_reranking(
             candidates,
+            query_features,  # Pass query_features for domain inference
             db,
-            prefer_source=prefer_source,
-            promote_diversity=promote_diversity
+            prefer_source=pref,  # Use inferred domain as prefer_source
+            promote_diversity=promote_diversity,
+            emb_getter=emb_get
         )
-        
+         
         # Return top-K
         return reranked[:top_k]
 
@@ -390,24 +434,24 @@ class AdaptiveReRanker(TwoStageSearchEngine):
         if query_type == 'specific':
             # For specific queries, trust vector similarity more
             weights = {
-                'vector_similarity': 0.75,
-                'species_frequency': 0.10,
+                'vector_similarity': 0.80,
+                'species_prior': 0.05,
                 'source_preference': 0.10,
                 'diversity': 0.05
             }
         elif query_type == 'general':
             # For general queries, promote diversity
             weights = {
-                'vector_similarity': 0.50,
-                'species_frequency': 0.15,
+                'vector_similarity': 0.65,
+                'species_prior': 0.05,
                 'source_preference': 0.15,
-                'diversity': 0.20
+                'diversity': 0.15
             }
         else:  # ambiguous
             # Balanced weights
             weights = {
-                'vector_similarity': 0.60,
-                'species_frequency': 0.15,
+                'vector_similarity': 0.70,
+                'species_prior': 0.05,
                 'source_preference': 0.15,
                 'diversity': 0.10
             }
@@ -421,9 +465,22 @@ class AdaptiveReRanker(TwoStageSearchEngine):
               db: Session,
               top_k: int = 10,
               prefer_source: str = "lab",
-              promote_diversity: bool = True) -> List[SearchCandidate]:
+              promote_diversity: bool = True,
+              emb_getter: Optional[Callable[[int], np.ndarray]] = None) -> List[SearchCandidate]:
         """
         Adaptive search with automatic weight adjustment
+
+        Args:
+            search_function: Vector search function
+            query_features: Query feature vector
+            db: Database session
+            top_k: Number of results to return
+            prefer_source: Preferred image source ("lab", "field", or None/"auto" to infer)
+            promote_diversity: Whether to promote diversity
+            emb_getter: Function to get embedding for a file_id (required when promote_diversity=True)
+             
+        Returns:
+            Top-K re-ranked candidates
         """
         # Detect query type
         query_type = self.detect_query_type(query_features)
@@ -433,7 +490,7 @@ class AdaptiveReRanker(TwoStageSearchEngine):
         self.weights = self.adjust_weights(query_type)
         
         # Perform search
-        results = super().search(search_function, query_features, db, top_k, prefer_source, promote_diversity)
+        results = super().search(search_function, query_features, db, top_k, prefer_source, promote_diversity, emb_getter)
         
         # Restore original weights
         self.weights = original_weights

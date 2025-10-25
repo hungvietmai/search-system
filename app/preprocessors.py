@@ -100,24 +100,125 @@ class AdvancedLeafPreprocessor:
             # Create mask
             mask = np.zeros(image.shape[:2], np.uint8)
             
-            # Define rectangle around the leaf (assume centered)
+            # Define rectangle around the leaf (more precise based on image characteristics)
             h, w = image.shape[:2]
-            rect = (int(w*0.1), int(h*0.1), int(w*0.8), int(h*0.8))
+            
+            # Use edge detection to help determine leaf boundaries more accurately
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            edges = cv2.Canny(gray, 50, 150)
+            
+            # Find contours to determine the bounding box of the main object
+            contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if contours:
+                # Get the largest contour (assuming it's the leaf)
+                largest_contour = max(contours, key=cv2.contourArea)
+                x, y, w_roi, h_roi = cv2.boundingRect(largest_contour)
+                
+                # Add padding to ensure we include the entire leaf
+                padding_x = int(w_roi * 0.15)  # Increased padding for better coverage
+                padding_y = int(h_roi * 0.15)  # Increased padding for better coverage
+                
+                # Ensure the rectangle stays within image bounds
+                x = max(0, x - padding_x)
+                y = max(0, y - padding_y)
+                w_roi = min(w - x, w_roi + 2 * padding_x)
+                h_roi = min(h - y, h_roi + 2 * padding_y)
+                
+                # Ensure the rectangle is not too small
+                w_roi = max(10, w_roi)
+                h_roi = max(10, h_roi)
+                
+                rect = (x, y, w_roi, h_roi)
+            else:
+                # Fallback to a rectangle that's guaranteed to include both foreground and background
+                # Use a rectangle that's smaller than the full image to ensure there's background
+                margin_x = max(1, int(w * 0.2))
+                margin_y = max(1, int(h * 0.2))
+                rect = (margin_x, margin_y, w - 2 * margin_x, h - 2 * margin_y)
             
             # GrabCut parameters
             bgd_model = np.zeros((1, 65), np.float64)
             fgd_model = np.zeros((1, 65), np.float64)
             
-            # Apply GrabCut
-            cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
+            # Additional validation to ensure the rectangle is valid
+            x, y, w_rect, h_rect = rect
+            if w_rect <= 0 or h_rect <= 0 or x + w_rect > w or y + h_rect > h:
+                logger.warning("Invalid rectangle for GrabCut, using fallback")
+                return self.remove_background_otsu(image)  # Use a simpler method as fallback
+            
+            # Early validation: Check if the image has enough contrast to distinguish foreground/background
+            # If the image is too uniform, skip GrabCut and use Otsu directly
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            mean_val = np.mean(gray)
+            std_val = np.std(gray)
+            
+            # If standard deviation is too low, the image is likely too uniform for GrabCut to work well
+            if std_val < 10:
+                logger.info("Image too uniform for GrabCut, using Otsu fallback")
+                return self.remove_background_otsu(image)
+            
+            # Initialize GrabCut with a more robust approach to ensure bgdSamples and fgdSamples are populated
+            # First, try to initialize with the rectangle method
+            try:
+                # Check if the rectangle region has enough contrast to proceed with GrabCut
+                x, y, w, h = rect
+                roi = gray[y:y+h, x:x+w]
+                roi_std = np.std(roi)
+                
+                # If the ROI is too uniform, GrabCut is likely to fail
+                if roi_std < 5:
+                    logger.info("ROI too uniform for GrabCut, using Otsu fallback")
+                    return self.remove_background_otsu(image)
+                
+                # Increase iterations for better accuracy
+                cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 10, cv2.GC_INIT_WITH_RECT)  # Increased iterations
+                
+                # Check if bgdSamples and fgdSamples are populated by checking mask values
+                # After initialization, mask should have both 0s (definitely background) and other values
+                mask_values, counts = np.unique(mask, return_counts=True)
+                
+                # If mask only has 0s (background) or only 0s and 2s (probable background),
+                # it means no foreground pixels were identified
+                has_foreground = 1 in mask or 3 in mask  # 1=prob_fg, 3=def_fg
+                has_background = 0 in mask or 2 in mask  # 0=def_bg, 2=prob_bg
+                
+                if not (has_foreground and has_background):
+                    # If initialization didn't work properly, try with a different approach
+                    # Create a more conservative mask based on the rectangle
+                    mask[:] = 0  # Start with all background
+                    x, y, w, h = rect
+                    # Mark the rectangle area as probable foreground
+                    mask[y:y+h, x:x+w] = 3  # Definite foreground
+                    
+                    # Run GrabCut again with the modified mask
+                    cv2.grabCut(image, mask, rect, bgd_model, fgd_model, 15, cv2.GC_INIT_WITH_MASK)  # Increased iterations
+            except cv2.error as cv2_error:
+                logger.warning(f"GrabCut failed with OpenCV error: {cv2_error}, using fallback")
+                # Return result from alternative method if GrabCut fails completely
+                return self.remove_background_otsu(image)  # Use a simpler method as fallback
             
             # Create binary mask
             mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
             
-            # Morphological operations to clean up
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+            # Check if the mask is valid (has both foreground and background pixels)
+            total_pixels = mask2.size
+            fg_pixels = np.sum(mask2)
+            bg_pixels = total_pixels - fg_pixels
+            
+            if fg_pixels == 0 or bg_pixels == 0:
+                logger.warning("GrabCut produced invalid mask (all foreground or all background), using fallback")
+                # Try alternative method
+                return self.remove_background_otsu(image)
+            
+            # Enhanced morphological operations to clean up
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))  # Larger kernel for better cleanup
             mask2 = cv2.morphologyEx(mask2, cv2.MORPH_CLOSE, kernel)
             mask2 = cv2.morphologyEx(mask2, cv2.MORPH_OPEN, kernel)
+            
+            # Additional dilation to expand the leaf area slightly and fill small gaps
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # Larger dilation kernel
+            mask2 = cv2.dilate(mask2, kernel_dilate, iterations=2)  # More iterations
             
             # Apply mask with WHITE background (to match dataset format)
             result = np.ones_like(image) * 255  # White background
@@ -127,6 +228,54 @@ class AdvancedLeafPreprocessor:
             
         except Exception as e:
             logger.warning(f"GrabCut failed: {e}, using fallback")
+            return self.remove_background_otsu(image)  # Use a simpler method as fallback
+    
+    def remove_background_otsu(self, image: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Simple background removal using Otsu's thresholding on grayscale
+        Used as a fallback when GrabCut fails
+        
+        Args:
+            image: Image as numpy array
+            
+        Returns:
+            Tuple of (processed image, mask)
+        """
+        try:
+            # Convert to grayscale
+            gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+            
+            # Apply Gaussian blur to reduce noise
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            
+            # Apply Otsu's thresholding
+            _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # Invert mask if leaf is darker than background (common case)
+            # Count white vs black pixels to determine which is foreground
+            white_pixels = np.sum(mask == 255)
+            black_pixels = np.sum(mask == 0)
+            
+            if white_pixels > black_pixels:
+                # Assume leaf is darker, so invert mask
+                mask = 255 - mask
+            
+            # Convert to binary mask (0 and 1)
+            mask = (mask > 0).astype(np.uint8)
+            
+            # Clean up mask with morphological operations
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+            
+            # Apply mask with WHITE background (to match dataset format)
+            result = np.ones_like(image) * 255  # White background
+            result[mask == 1] = image[mask == 1]  # Copy leaf pixels
+            
+            return result, mask
+            
+        except Exception as e:
+            logger.warning(f"Otsu fallback failed: {e}, returning original")
             return image, np.ones(image.shape[:2], dtype=np.uint8)
     
     def remove_background_kmeans(self, image: np.ndarray, k=3) -> Tuple[np.ndarray, np.ndarray]:
@@ -289,8 +438,8 @@ class AdvancedLeafPreprocessor:
         # Convert to LAB color space
         lab = cv2.cvtColor(image, cv2.COLOR_RGB2LAB)
         
-        # Apply CLAHE to L channel
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        # Apply CLAHE to L channel with optimized parameters for leaf images
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))  # Optimized for leaf images: lower clip limit, larger tiles
         lab[:, :, 0] = clahe.apply(lab[:, :, 0])
         
         # Convert back to RGB

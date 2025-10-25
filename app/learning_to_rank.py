@@ -399,12 +399,184 @@ class LearningToRankEngine:
             relevance_scores: List of relevance scores (queries)
         """
         if hasattr(self.model, 'learn_weights'):
-            self.model.learn_weights(features_list, relevance_scores)  # type: ignore
+            self.model.learn_weights(features_list, relevance_scores) # type: ignore
         elif hasattr(self.model, 'train'):
             self.model.train(features_list, relevance_scores)  # type: ignore
         
         # Save updated model
         self.save_model()
+    
+    def train_with_validation(self,
+                            train_features: List[List[RankingFeatures]],
+                            train_relevance: List[List[float]],
+                            val_features: List[List[RankingFeatures]],
+                            val_relevance: List[List[float]],
+                            learning_rate: float = 0.01,
+                            iterations: int = 100) -> Dict[str, List[float]]:
+        """
+        Train model with validation monitoring to prevent overfitting
+        
+        Args:
+            train_features: Training feature lists
+            train_relevance: Training relevance scores
+            val_features: Validation feature lists
+            val_relevance: Validation relevance scores
+            learning_rate: Learning rate for training
+            iterations: Number of training iterations
+            
+        Returns:
+            Dictionary with training/validation metrics over iterations
+        """
+        logger.info("Training with validation monitoring...")
+        
+        if self.algorithm == LTRAlgorithm.LINEAR and hasattr(self.model, 'learn_weights'):
+            # For LinearLTR, we need to implement validation-aware training
+            train_losses = []
+            val_losses = []
+            
+            # Store original weights to restore best model
+            original_weights = self.model.weights.copy()
+            
+            # Best model tracking
+            best_val_loss = float('inf')
+            best_weights = original_weights.copy()
+            
+            for iteration in range(iterations):
+                # Train for one iteration
+                temp_model = LinearLTR(weights=self.model.weights.copy())
+                temp_model.learn_weights(
+                    train_features,
+                    train_relevance,
+                    learning_rate=learning_rate,
+                    iterations=1
+                )
+                
+                # Calculate training loss
+                train_loss = self._calculate_loss(temp_model, train_features, train_relevance)
+                train_losses.append(train_loss)
+                
+                # Calculate validation loss
+                val_loss = self._calculate_loss(temp_model, val_features, val_relevance)
+                val_losses.append(val_loss)
+                
+                # Update model weights
+                self.model.weights = temp_model.weights.copy()
+                
+                # Track best model based on validation loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_weights = self.model.weights.copy()
+                
+                # Log progress
+                if (iteration + 1) % 10 == 0:
+                    logger.info(f"Iteration {iteration + 1}/{iterations}, "
+                              f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Restore best model based on validation performance
+            self.model.weights = best_weights
+            
+            logger.info(f"Training complete. Best validation loss: {best_val_loss:.4f}")
+            
+            return {
+                'train_losses': train_losses,
+                'val_losses': val_losses
+            }
+            
+        elif self.algorithm == LTRAlgorithm.RANKNET and hasattr(self.model, 'train'):
+            # For PairwiseLTR, use validation-aware training
+            train_losses = []
+            val_losses = []
+            
+            # Store original weights to restore best model
+            original_weights = self.model.weights.copy()
+            
+            # Best model tracking
+            best_val_loss = float('inf')
+            best_weights = original_weights.copy()
+            
+            for iteration in range(iterations):
+                # Train for one iteration
+                temp_model = PairwiseLTR(feature_dim=self.model.feature_dim)
+                temp_model.weights = self.model.weights.copy()
+                
+                temp_model.train(
+                    train_features,
+                    train_relevance,
+                    learning_rate=learning_rate,
+                    iterations=1
+                )
+                
+                # Calculate training loss
+                train_loss = self._calculate_loss(temp_model, train_features, train_relevance)
+                train_losses.append(train_loss)
+                
+                # Calculate validation loss
+                val_loss = self._calculate_loss(temp_model, val_features, val_relevance)
+                val_losses.append(val_loss)
+                
+                # Update model weights
+                self.model.weights = temp_model.weights.copy()
+                
+                # Track best model based on validation loss
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    best_weights = self.model.weights.copy()
+                
+                # Log progress
+                if (iteration + 1) % 10 == 0:
+                    logger.info(f"Iteration {iteration + 1}/{iterations}, "
+                              f"Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+            
+            # Restore best model based on validation performance
+            self.model.weights = best_weights
+            
+            logger.info(f"Training complete. Best validation loss: {best_val_loss:.4f}")
+            
+            return {
+                'train_losses': train_losses,
+                'val_losses': val_losses
+            }
+            
+        else:
+            logger.warning("Training with validation not fully implemented for this algorithm")
+            # Fallback to regular training
+            self.update_model(train_features, train_relevance)
+            return {'train_losses': [], 'val_losses': []}
+    
+    def _calculate_loss(self, model, features_list: List[List[RankingFeatures]], relevance_scores: List[List[float]]) -> float:
+        """
+        Calculate loss for a model on given features and relevance scores
+        
+        Args:
+            model: Model to evaluate
+            features_list: List of feature lists
+            relevance_scores: List of relevance scores
+            
+        Returns:
+            Average loss across all queries
+        """
+        total_loss = 0.0
+        total_samples = 0
+        
+        for features, relevances in zip(features_list, relevance_scores):
+            # Calculate predictions
+            predictions = []
+            for f in features:
+                if hasattr(model, 'score'):
+                    pred = model.score(f)
+                else:
+                    pred = np.dot(model.weights, f.to_array())
+                predictions.append(pred)
+            
+            # Calculate MSE loss
+            predictions = np.array(predictions)
+            relevances = np.array(relevances)
+            loss = np.mean((predictions - relevances) ** 2)
+            
+            total_loss += loss * len(relevances)
+            total_samples += len(relevances)
+        
+        return total_loss / total_samples if total_samples > 0 else 0.0
     
     def save_model(self):
         """Save model to disk"""

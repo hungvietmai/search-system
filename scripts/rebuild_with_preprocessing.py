@@ -402,7 +402,7 @@ def rebuild_index_with_preprocessing(
     print(f"  Total images: {total}")
     print(f"  Successfully indexed: {len(all_file_ids)}")
     print(f"  Failed: {failed}")
-    print(f"  Success rate: {(len(all_file_ids)/total)*10:.1f}%")
+    print(f" Success rate: {(len(all_file_ids)/total)*100:.1f}%")
     print("\nNext steps:")
     print("1. Update app/main.py to enable query preprocessing:")
     print("   use_query_segmentation=True")

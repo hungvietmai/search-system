@@ -84,10 +84,10 @@ class ConfidenceScorer:
         """Initialize confidence scorer"""
         # Thresholds for distance (L2)
         self.distance_thresholds = {
-            'excellent': 0.3,   # Very similar
-            'good': 0.6,        # Similar
-            'fair': 1.0,        # Somewhat similar
-            'poor': 1.5         # Dissimilar
+            'excellent': 0.4,   # More permissive threshold
+            'good': 0.7,        # More permissive threshold
+            'fair': 1.1,        # More permissive threshold
+            'poor': 1.6         # More permissive threshold
         }
     
     def distance_to_similarity(self, distance: float) -> float:
@@ -233,14 +233,14 @@ class ConfidenceScorer:
         """
         components = []
         
-        # 1. Distance-based score (40% weight)
+        # 1. Distance-based score (50% weight) - Increased to prioritize visual similarity
         dist_score, dist_desc = self.calculate_distance_score(distance)
         components.append(ExplanationComponent(
             factor="Visual Similarity",
             score=dist_score,
-            weight=0.40,
+            weight=0.50,
             description=dist_desc,
-            contribution=dist_score * 0.40
+            contribution=dist_score * 0.50
         ))
         
         # 2. Rank-based score (20% weight)
@@ -253,24 +253,24 @@ class ConfidenceScorer:
             contribution=rank_score * 0.20
         ))
         
-        # 3. Species frequency score (25% weight)
+        # 3. Species frequency score (20% weight) - Reduced slightly
         freq_score, freq_desc = self.calculate_species_frequency_score(species, db)
         components.append(ExplanationComponent(
             factor="Species Data Quality",
             score=freq_score,
-            weight=0.25,
+            weight=0.20,
             description=freq_desc,
-            contribution=freq_score * 0.25
+            contribution=freq_score * 0.20
         ))
         
-        # 4. Source quality score (15% weight)
+        # 4. Source quality score (10% weight) - Reduced to prioritize visual similarity
         source_score, source_desc = self.calculate_source_score(source)
         components.append(ExplanationComponent(
             factor="Image Quality",
             score=source_score,
-            weight=0.15,
+            weight=0.10,
             description=source_desc,
-            contribution=source_score * 0.15
+            contribution=source_score * 0.10
         ))
         
         # Calculate weighted confidence score
@@ -513,7 +513,33 @@ class ResultExplainer:
         """
         explanations = []
         
+        # Import feature cache and feature extractor to get result features
+        from app.cache import get_feature_cache
+        from app.feature_extractor import get_feature_extractor
+        feature_cache = get_feature_cache()
+        feature_extractor = get_feature_extractor()
+        
         for i, result in enumerate(results):
+            # Try to get result features from cache first
+            result_features = feature_cache.get_features(result['file_id'])
+            
+            # If not in cache, try to extract features from the image
+            if result_features is None:
+                try:
+                    # Get image path from database using file_id
+                    image_record = db.query(LeafImage).filter(LeafImage.file_id == result['file_id']).first()
+                    if image_record and image_record.image_path:
+                        # Construct absolute path from settings.dataset_path
+                        from pathlib import Path
+                        from config import settings
+                        abs_path = Path(settings.dataset_path).parent / image_record.image_path
+                        # Extract features for the result image
+                        result_features = feature_extractor.extract_features(str(abs_path), is_query=False)
+                        # Cache the features for future use
+                        feature_cache.set_features(result['file_id'], result_features)
+                except Exception as e:
+                    logger.warning(f"Failed to extract features for file_id {result['file_id']}: {e}")
+            
             explanation = self.explain_result(
                 file_id=result['file_id'],
                 species=result['species'],
@@ -522,7 +548,7 @@ class ResultExplainer:
                 position=i,
                 total_results=len(results),
                 query_features=query_features,
-                result_features=None,  # Would need to fetch from cache/DB
+                result_features=result_features,
                 db=db
             )
             explanations.append(explanation)
